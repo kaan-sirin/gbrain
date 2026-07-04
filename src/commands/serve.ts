@@ -81,6 +81,7 @@ export async function runServe(
   // verifyAccessToken with legacy access_tokens fallback (so v0.22.7 callers
   // that used `gbrain auth create` keep working unchanged).
   const isHttp = args.includes('--http');
+  const localDaemon = args.includes('--local-daemon');
 
   if (isHttp) {
     const portIdx = args.indexOf('--port');
@@ -129,6 +130,26 @@ export async function runServe(
 
     const { runServeHttp } = await import('./serve-http.ts');
     await runServeHttp(engine, { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams, bind, suppressBootstrapToken, printAdminToken });
+    return;
+  }
+
+  if (localDaemon) {
+    console.error('Starting GBrain local daemon...');
+    const { startLocalIpcServers } = await import('../mcp/server.ts');
+    const localIpc = await startLocalIpcServers(engine);
+    let shuttingDown = false;
+    const shutdown = (reason: string, code = 0) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.error(`[gbrain-serve] shutdown: ${reason}`);
+      localIpc.close();
+      Promise.resolve(engine.disconnect?.())
+        .catch(() => {})
+        .finally(() => process.exit(code));
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    await new Promise<void>(() => {});
     return;
   }
 

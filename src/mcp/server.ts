@@ -22,6 +22,72 @@ import {
 } from '../core/context/import-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
 
+export interface LocalIpcServers {
+  close(): void;
+}
+
+export async function startLocalIpcServers(engine: BrainEngine): Promise<LocalIpcServers> {
+  let resolveServer: import('node:net').Server | null = null;
+  let resolveSocket: string | null = null;
+  let importServer: import('node:net').Server | null = null;
+  let importSocket: string | null = null;
+  let commandServer: import('node:net').Server | null = null;
+  let commandSocket: string | null = null;
+
+  const cfg = loadConfig();
+  if (cfg?.engine === 'pglite' && cfg.database_path) {
+    resolveSocket = resolveSocketPath(cfg.database_path);
+    importSocket = importSocketPath(cfg.database_path);
+    commandSocket = commandSocketPath(cfg.database_path);
+    const defaultSource = process.env.GBRAIN_SOURCE || 'default';
+    resolveServer = await startResolveIpcServer(
+      resolveSocket,
+      (req) =>
+        resolveEntitiesToPointers(
+          engine,
+          req.sourceId || defaultSource,
+          req.candidates ?? [],
+          {
+            priorContextText: req.priorContextText,
+            maxPointers: req.maxPointers,
+            suppression: req.suppression,
+          },
+        ),
+      // The IPC resolve path IS the ambient reflex channel. Logging happens
+      // at DELIVERY (post-write), not inside the resolver — a block the
+      // client's 250ms budget abandoned was never injected, and counting it
+      // would corrupt the volunteered-vs-used precision stats (red-team).
+      (block) => logDeliveredReflexPointers(engine, block.pointers),
+    );
+    importServer = await startImportIpcServer(
+      importSocket,
+      async (req) => {
+        const { runImport } = await import('../commands/import.ts');
+        const result = await runImport(engine, req.args || []);
+        return { result };
+      },
+    );
+    commandServer = await startCommandIpcServer(
+      commandSocket,
+      async (req) => {
+        const result = await handleToolCall(engine, req.op, req.params || {}, { sourceId: defaultSource });
+        return { result };
+      },
+    );
+  }
+
+  return {
+    close() {
+      try { resolveServer?.close(); } catch { /* noop */ }
+      try { importServer?.close(); } catch { /* noop */ }
+      try { commandServer?.close(); } catch { /* noop */ }
+      if (resolveSocket) cleanupStaleSocket(resolveSocket);
+      if (importSocket) cleanupStaleImportSocket(importSocket);
+      if (commandSocket) cleanupStaleImportSocket(commandSocket);
+    },
+  };
+}
+
 export async function startMcpServer(engine: BrainEngine) {
   const server = new Server(
     { name: 'gbrain', version: VERSION },
@@ -68,56 +134,11 @@ export async function startMcpServer(engine: BrainEngine) {
   // connection, so the context engine resolves salient entities THROUGH us over
   // a local unix socket rather than opening a second (impossible) connection.
   // Best-effort; failure to bind never blocks the MCP server.
-  let resolveServer: import('node:net').Server | null = null;
-  let resolveSocket: string | null = null;
-  let importServer: import('node:net').Server | null = null;
-  let importSocket: string | null = null;
-  let commandServer: import('node:net').Server | null = null;
-  let commandSocket: string | null = null;
+  let localIpc: LocalIpcServers | null = null;
   try {
-    const cfg = loadConfig();
-    if (cfg?.engine === 'pglite' && cfg.database_path) {
-      resolveSocket = resolveSocketPath(cfg.database_path);
-      importSocket = importSocketPath(cfg.database_path);
-      commandSocket = commandSocketPath(cfg.database_path);
-      const defaultSource = process.env.GBRAIN_SOURCE || 'default';
-      resolveServer = await startResolveIpcServer(
-        resolveSocket,
-        (req) =>
-          resolveEntitiesToPointers(
-            engine,
-            req.sourceId || defaultSource,
-            req.candidates ?? [],
-            {
-              priorContextText: req.priorContextText,
-              maxPointers: req.maxPointers,
-              suppression: req.suppression,
-            },
-          ),
-        // The IPC resolve path IS the ambient reflex channel. Logging happens
-        // at DELIVERY (post-write), not inside the resolver — a block the
-        // client's 250ms budget abandoned was never injected, and counting it
-        // would corrupt the volunteered-vs-used precision stats (red-team).
-        (block) => logDeliveredReflexPointers(engine, block.pointers),
-      );
-      importServer = await startImportIpcServer(
-        importSocket,
-        async (req) => {
-          const { runImport } = await import('../commands/import.ts');
-          const result = await runImport(engine, req.args || []);
-          return { result };
-        },
-      );
-      commandServer = await startCommandIpcServer(
-        commandSocket,
-        async (req) => {
-          const result = await handleToolCall(engine, req.op, req.params || {}, { sourceId: defaultSource });
-          return { result };
-        },
-      );
-    }
+    localIpc = await startLocalIpcServers(engine);
   } catch {
-    /* resolve IPC is best-effort; never block serve */
+    /* local IPC is best-effort; never block MCP serve */
   }
 
   // Exit cleanly when MCP client disconnects (stdin EOF) or on signals.
@@ -128,12 +149,7 @@ export async function startMcpServer(engine: BrainEngine) {
     if (shuttingDown) return;
     shuttingDown = true;
     process.stderr.write(`[gbrain-serve] shutdown: ${reason}\n`);
-    try { resolveServer?.close(); } catch { /* noop */ }
-    try { importServer?.close(); } catch { /* noop */ }
-    try { commandServer?.close(); } catch { /* noop */ }
-    if (resolveSocket) cleanupStaleSocket(resolveSocket);
-    if (importSocket) cleanupStaleImportSocket(importSocket);
-    if (commandSocket) cleanupStaleImportSocket(commandSocket);
+    localIpc?.close();
     Promise.resolve(engine.disconnect?.())
       .catch(() => {})
       .finally(() => process.exit(code));
