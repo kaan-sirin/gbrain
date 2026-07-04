@@ -13,6 +13,13 @@ import {
   startResolveIpcServer,
   cleanupStaleSocket,
 } from '../core/context/resolve-ipc.ts';
+import {
+  commandSocketPath,
+  importSocketPath,
+  startCommandIpcServer,
+  startImportIpcServer,
+  cleanupStaleImportSocket,
+} from '../core/context/import-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
 
 export async function startMcpServer(engine: BrainEngine) {
@@ -63,10 +70,16 @@ export async function startMcpServer(engine: BrainEngine) {
   // Best-effort; failure to bind never blocks the MCP server.
   let resolveServer: import('node:net').Server | null = null;
   let resolveSocket: string | null = null;
+  let importServer: import('node:net').Server | null = null;
+  let importSocket: string | null = null;
+  let commandServer: import('node:net').Server | null = null;
+  let commandSocket: string | null = null;
   try {
     const cfg = loadConfig();
     if (cfg?.engine === 'pglite' && cfg.database_path) {
       resolveSocket = resolveSocketPath(cfg.database_path);
+      importSocket = importSocketPath(cfg.database_path);
+      commandSocket = commandSocketPath(cfg.database_path);
       const defaultSource = process.env.GBRAIN_SOURCE || 'default';
       resolveServer = await startResolveIpcServer(
         resolveSocket,
@@ -87,6 +100,21 @@ export async function startMcpServer(engine: BrainEngine) {
         // would corrupt the volunteered-vs-used precision stats (red-team).
         (block) => logDeliveredReflexPointers(engine, block.pointers),
       );
+      importServer = await startImportIpcServer(
+        importSocket,
+        async (req) => {
+          const { runImport } = await import('../commands/import.ts');
+          const result = await runImport(engine, req.args || []);
+          return { result };
+        },
+      );
+      commandServer = await startCommandIpcServer(
+        commandSocket,
+        async (req) => {
+          const result = await handleToolCall(engine, req.op, req.params || {}, { sourceId: defaultSource });
+          return { result };
+        },
+      );
     }
   } catch {
     /* resolve IPC is best-effort; never block serve */
@@ -101,7 +129,11 @@ export async function startMcpServer(engine: BrainEngine) {
     shuttingDown = true;
     process.stderr.write(`[gbrain-serve] shutdown: ${reason}\n`);
     try { resolveServer?.close(); } catch { /* noop */ }
+    try { importServer?.close(); } catch { /* noop */ }
+    try { commandServer?.close(); } catch { /* noop */ }
     if (resolveSocket) cleanupStaleSocket(resolveSocket);
+    if (importSocket) cleanupStaleImportSocket(importSocket);
+    if (commandSocket) cleanupStaleImportSocket(commandSocket);
     Promise.resolve(engine.disconnect?.())
       .catch(() => {})
       .finally(() => process.exit(code));
