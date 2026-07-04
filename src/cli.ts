@@ -351,12 +351,36 @@ async function main() {
     }
   }
 
+  const cfgPre = loadConfig();
+
+  if (
+    ['search', 'query'].includes(op.name) &&
+    process.env.GBRAIN_COMMAND_IPC !== '0' &&
+    cfgPre?.engine === 'pglite' &&
+    cfgPre.database_path
+  ) {
+    try {
+      const { commandSocketPath, commandViaIpc, IMPORT_IPC_UNAVAILABLE } = await import('./core/context/import-ipc.ts');
+      const delegated = await commandViaIpc(commandSocketPath(cfgPre.database_path), {
+        op: op.name,
+        params,
+      });
+      if (delegated !== IMPORT_IPC_UNAVAILABLE) {
+        const result = (delegated as { result: unknown }).result;
+        const output = formatResult(op.name, result);
+        if (output) process.stdout.write(output);
+        return;
+      }
+    } catch (e) {
+      console.error(`[gbrain ${command}] serve delegation failed; falling back to direct command: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   // v0.31.1 (Issue #734, CDX-1 routing seam): on thin-client installs,
   // route every non-localOnly op through callRemoteTool instead of opening
   // the empty local PGLite. localOnly ops can't run on a thin client at all
   // (no local engine, server intentionally hides them) — refuse with hint.
   // Fix for the silent-empty-results bug class that motivated this whole release.
-  const cfgPre = loadConfig();
   if (isThinClient(cfgPre)) {
     if (op.localOnly) {
       refuseThinClient(command, cfgPre!.remote_mcp!.mcp_url);
@@ -1569,6 +1593,31 @@ async function handleCliOnly(command: string, args: string[]) {
       // A bad --hard-deadline value throws here (same posture as --timeout).
       console.error(e instanceof Error ? e.message : String(e));
       process.exit(1);
+    }
+  }
+
+  if (command === 'import' && process.env.GBRAIN_IMPORT_IPC !== '0') {
+    try {
+      const { loadConfig } = await import('./core/config.ts');
+      const cfg = loadConfig();
+      if (cfg?.engine === 'pglite' && cfg.database_path) {
+        const { importSocketPath, importViaIpc, IMPORT_IPC_UNAVAILABLE } = await import('./core/context/import-ipc.ts');
+        const delegated = await importViaIpc(importSocketPath(cfg.database_path), { args });
+        if (delegated !== IMPORT_IPC_UNAVAILABLE) {
+          const result = (delegated as { result: import('./commands/import.ts').RunImportResult }).result;
+          console.log('Delegated import to running gbrain serve.');
+          console.log('');
+          console.log('Import complete:');
+          console.log(`  ${result.imported} pages imported`);
+          console.log(`  ${result.skipped} pages skipped`);
+          console.log(`  ${result.errors} errors`);
+          console.log(`  ${result.chunksCreated} chunks created`);
+          if (result.errors > 0) setCliExitVerdict(1);
+          return;
+        }
+      }
+    } catch (e) {
+      console.error(`[gbrain import] serve delegation failed; falling back to direct import: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
