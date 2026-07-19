@@ -380,19 +380,21 @@ async function main() {
     cfgPre?.engine === 'pglite' &&
     cfgPre.database_path
   ) {
+    const { commandSocketPath, commandViaIpc, isCommandIpcUnavailableError } = await import('./core/context/import-ipc.ts');
     try {
-      const { commandSocketPath, commandViaIpc, IMPORT_IPC_UNAVAILABLE } = await import('./core/context/import-ipc.ts');
       const delegated = await commandViaIpc(commandSocketPath(cfgPre.database_path), {
+        callerKind: 'trusted-cli',
         op: op.name,
         params,
       });
-      if (delegated !== IMPORT_IPC_UNAVAILABLE) {
-        const result = (delegated as { result: unknown }).result;
-        const output = formatResult(op.name, result);
-        if (output) process.stdout.write(output);
-        return;
-      }
+      const result = delegated.result;
+      const output = formatResult(op.name, result);
+      if (output) process.stdout.write(output);
+      return;
     } catch (e) {
+      if (!isCommandIpcUnavailableError(e)) {
+        throw e;
+      }
       console.error(`[gbrain ${command}] serve delegation failed; falling back to direct command: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
@@ -1270,6 +1272,11 @@ async function handleCliOnly(command: string, args: string[]) {
     // internally; does not need its own DB connection.
     const { runSkillpackCheck } = await import('./commands/skillpack-check.ts');
     await runSkillpackCheck(args);
+    return;
+  }
+  if (command === 'serve' && args.includes('--ipc-proxy')) {
+    const { runServeIpcProxy } = await import('./commands/serve.ts');
+    await runServeIpcProxy(args);
     return;
   }
   if (command === 'doctor') {
@@ -2420,6 +2427,7 @@ ADMIN
   storage status [--repo <path>]     Storage tier status and health
         [--json]                     (git-tracked vs supabase-only)
   serve                              MCP server (stdio)
+  serve --ipc-proxy                  DB-free stdio MCP proxy over local daemon IPC
   serve --http [--port N]            HTTP MCP server with OAuth 2.1
     --token-ttl N                    Access token TTL in seconds (default: 3600)
     --enable-dcr                     Enable Dynamic Client Registration (DCR clients default to authorization_code)

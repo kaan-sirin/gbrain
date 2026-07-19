@@ -3,11 +3,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  CommandIpcError,
   commandSocketPath,
   commandViaIpc,
-  IMPORT_IPC_UNAVAILABLE,
   importSocketPath,
   importViaIpc,
+  IMPORT_IPC_UNAVAILABLE,
   startCommandIpcServer,
   startImportIpcServer,
 } from '../../src/core/context/import-ipc.ts';
@@ -66,9 +67,9 @@ describe('import IPC', () => {
   test('delegates command params to the server owner', async () => {
     const dir = tempDir();
     const sock = commandSocketPath(dir);
-    const seen: Array<{ op: string; params: Record<string, unknown> }> = [];
+    const seen: Array<{ callerKind?: string; op: string; params: Record<string, unknown> }> = [];
     const server = await startCommandIpcServer(sock, async (req) => {
-      seen.push({ op: req.op, params: req.params });
+      seen.push({ callerKind: req.callerKind, op: req.op, params: req.params });
       return {
         result: [
           { slug: 'concepts/example', score: 0.9, chunk_text: 'example result' },
@@ -77,14 +78,95 @@ describe('import IPC', () => {
     });
     expect(server).toBeTruthy();
     try {
-      const got = await commandViaIpc(sock, { op: 'search', params: { query: 'example' } });
-      expect(got).not.toBe(IMPORT_IPC_UNAVAILABLE);
-      if (got !== IMPORT_IPC_UNAVAILABLE) {
-        expect(got.result).toEqual([
-          { slug: 'concepts/example', score: 0.9, chunk_text: 'example result' },
-        ]);
-      }
-      expect(seen).toEqual([{ op: 'search', params: { query: 'example' } }]);
+      const got = await commandViaIpc(sock, {
+        callerKind: 'trusted-cli',
+        op: 'search',
+        params: { query: 'example' },
+      });
+      expect(got.result).toEqual([
+        { slug: 'concepts/example', score: 0.9, chunk_text: 'example result' },
+      ]);
+      expect(seen).toEqual([{
+        callerKind: 'trusted-cli',
+        op: 'search',
+        params: { query: 'example' },
+      }]);
+    } finally {
+      server?.close();
+    }
+  });
+
+  test('missing command socket is a typed socket_missing error', async () => {
+    const dir = tempDir();
+    await expect(commandViaIpc(commandSocketPath(dir), {
+      callerKind: 'trusted-cli',
+      op: 'search',
+      params: { query: 'example' },
+    })).rejects.toMatchObject({
+      name: 'CommandIpcError',
+      reason: 'socket_missing',
+    } satisfies Partial<CommandIpcError>);
+  });
+
+  test('daemon operation errors stay operation errors', async () => {
+    const dir = tempDir();
+    const sock = commandSocketPath(dir);
+    const server = await startCommandIpcServer(sock, async () => {
+      throw new Error('search exploded');
+    });
+    expect(server).toBeTruthy();
+    try {
+      await expect(commandViaIpc(sock, {
+        callerKind: 'trusted-cli',
+        op: 'search',
+        params: { query: 'example' },
+      })).rejects.toMatchObject({
+        name: 'CommandIpcError',
+        reason: 'operation',
+        message: 'search exploded',
+      } satisfies Partial<CommandIpcError>);
+    } finally {
+      server?.close();
+    }
+  });
+
+  test('command IPC accepts payloads above 1 MiB up to the new cap', async () => {
+    const dir = tempDir();
+    const sock = commandSocketPath(dir);
+    const big = 'x'.repeat(2 * 1024 * 1024);
+    const server = await startCommandIpcServer(sock, async () => ({
+      result: { blob: big },
+    }));
+    expect(server).toBeTruthy();
+    try {
+      const got = await commandViaIpc(sock, {
+        callerKind: 'trusted-cli',
+        op: 'search',
+        params: { query: 'big' },
+      });
+      expect(got.result).toEqual({ blob: big });
+    } finally {
+      server?.close();
+    }
+  });
+
+  test('command IPC rejects payloads over the capped size safely', async () => {
+    const dir = tempDir();
+    const sock = commandSocketPath(dir);
+    const tooBig = 'x'.repeat(9 * 1024 * 1024);
+    const server = await startCommandIpcServer(sock, async () => ({
+      result: { blob: tooBig },
+    }));
+    expect(server).toBeTruthy();
+    try {
+      await expect(commandViaIpc(sock, {
+        callerKind: 'trusted-cli',
+        op: 'search',
+        params: { query: 'too-big' },
+      })).rejects.toMatchObject({
+        name: 'CommandIpcError',
+        reason: 'payload_too_large',
+      } satisfies Partial<CommandIpcError>);
     } finally {
       server?.close();
     }

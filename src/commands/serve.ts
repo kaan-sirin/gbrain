@@ -1,6 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import type { BrainEngine } from '../core/engine.ts';
-import { startMcpServer } from '../mcp/server.ts';
+import { startIpcProxyMcpServer, startMcpServer } from '../mcp/server.ts';
+import { commandSocketPath, CommandIpcError, probeCommandIpc } from '../core/context/import-ipc.ts';
+import { loadConfig } from '../core/config.ts';
 
 // Maximum time the stdio path will wait for engine.disconnect() (PGLite
 // close + advisory lock release) before forcing exit. Keeps a wedged
@@ -67,6 +69,8 @@ export interface ServeOptions {
   // transport.onclose still cover legitimate shutdown.
   // Defaults to `process.env.MCP_STDIO === '1'` when omitted.
   mcpStdio?: boolean;
+  // Test seam for the DB-free stdio proxy path.
+  startIpcProxyServer?: (socketPath: string) => Promise<void>;
 }
 
 export async function runServe(
@@ -160,7 +164,7 @@ export async function runServe(
   // and is intentionally NOT wired into this stdio plumbing.
   console.error('Starting GBrain MCP server (stdio)...');
 
-  installStdioLifecycle(engine, args, opts);
+  installStdioLifecycle(() => engine.disconnect(), args, opts);
 
   const start = opts.startMcpServer ?? startMcpServer;
   await start(engine);
@@ -169,6 +173,49 @@ export async function runServe(
   // event loop alive. We deliberately do NOT add `await new Promise(() =>
   // {})` here — it would block this async frame and stop the lifecycle
   // hooks from being able to call process.exit() cleanly.
+}
+
+export async function runServeIpcProxy(
+  args: string[] = [],
+  opts: ServeOptions = {},
+) {
+  const config = loadConfig();
+  if (!config) {
+    throw new Error('No brain configured. Run: gbrain init');
+  }
+  if (config.engine !== 'pglite' || !config.database_path) {
+    throw new Error(
+      'gbrain serve --ipc-proxy requires a local PGLite brain with database_path configured. ' +
+      'Use gbrain serve --local-daemon on the owning process, or plain gbrain serve for direct stdio MCP.',
+    );
+  }
+
+  const socketPath = commandSocketPath(config.database_path);
+  try {
+    await probeCommandIpc(socketPath);
+  } catch (err) {
+    if (err instanceof CommandIpcError) {
+      if (err.reason === 'socket_missing') {
+        throw new Error(
+          `No local daemon command socket found at ${socketPath}. Start it with: gbrain serve --local-daemon`,
+        );
+      }
+      if (err.reason === 'socket_unavailable' || err.reason === 'timeout') {
+        throw new Error(
+          `Could not reach the local daemon command socket at ${socketPath}. ` +
+          `Restart it with: gbrain serve --local-daemon`,
+        );
+      }
+    }
+    throw err;
+  }
+
+  console.error('Starting GBrain MCP IPC proxy (stdio)...');
+
+  installStdioLifecycle(async () => {}, args, opts);
+
+  const start = opts.startIpcProxyServer ?? startIpcProxyMcpServer;
+  await start(socketPath);
 }
 
 interface StdioLifecycleDeps {
@@ -183,7 +230,7 @@ interface StdioLifecycleDeps {
 }
 
 function installStdioLifecycle(
-  engine: BrainEngine,
+  cleanup: () => Promise<unknown>,
   args: string[],
   opts: ServeOptions,
 ): void {
@@ -229,7 +276,7 @@ function installStdioLifecycle(
     deadline.unref?.();
 
     Promise.resolve()
-      .then(() => engine.disconnect())
+      .then(() => cleanup())
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         deps.log(`GBrain MCP server: cleanup error: ${msg}`);

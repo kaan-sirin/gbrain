@@ -15,6 +15,10 @@ import {
 } from '../core/context/resolve-ipc.ts';
 import {
   commandSocketPath,
+  commandViaIpc,
+  CommandIpcError,
+  type CommandIpcRequest,
+  type CommandIpcResponse,
   importSocketPath,
   startCommandIpcServer,
   startImportIpcServer,
@@ -24,6 +28,61 @@ import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/c
 
 export interface LocalIpcServers {
   close(): void;
+}
+
+function buildRemoteMcpDispatchOpts(sourceId: string) {
+  return {
+    remote: true as const,
+    takesHoldersAllowList: ['world'],
+    sourceId,
+    metaHook: getBrainHotMemoryMeta,
+  };
+}
+
+function formatProxyCommandIpcError(socketPath: string, err: unknown): string {
+  if (err instanceof CommandIpcError) {
+    switch (err.reason) {
+      case 'socket_missing':
+        return `GBrain IPC proxy could not find the local daemon socket at ${socketPath}. Start the daemon with: gbrain serve --local-daemon`;
+      case 'socket_unavailable':
+      case 'timeout':
+        return `GBrain IPC proxy could not reach the local daemon socket at ${socketPath}. Restart the daemon with: gbrain serve --local-daemon`;
+      case 'payload_too_large':
+        return err.message;
+      case 'operation':
+      case 'protocol':
+        return err.message;
+      default:
+        return err.message;
+    }
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+export async function handleCommandIpcRequest(
+  engine: BrainEngine,
+  req: CommandIpcRequest,
+  opts: { sourceId: string },
+): Promise<CommandIpcResponse> {
+  const params = req.params || {};
+  if (req.callerKind === 'trusted-cli') {
+    const result = await handleToolCall(engine, req.op, params, { sourceId: opts.sourceId });
+    return { result };
+  }
+  if (req.callerKind === 'mcp-proxy') {
+    const result = await dispatchToolCall(
+      engine,
+      req.op,
+      params,
+      buildRemoteMcpDispatchOpts(opts.sourceId),
+    );
+    return { result };
+  }
+  throw new CommandIpcError(
+    'protocol',
+    'Command IPC callerKind must be one of: trusted-cli, mcp-proxy.',
+    { socketPath: 'command-ipc', code: 'invalid_caller_kind' },
+  );
 }
 
 export async function startLocalIpcServers(engine: BrainEngine): Promise<LocalIpcServers> {
@@ -69,10 +128,7 @@ export async function startLocalIpcServers(engine: BrainEngine): Promise<LocalIp
     );
     commandServer = await startCommandIpcServer(
       commandSocket,
-      async (req) => {
-        const result = await handleToolCall(engine, req.op, req.params || {}, { sourceId: defaultSource });
-        return { result };
-      },
+      (req) => handleCommandIpcRequest(engine, req, { sourceId: defaultSource }),
     );
   }
 
@@ -113,18 +169,12 @@ export async function startMcpServer(engine: BrainEngine) {
     // see private hunches via takes_list / takes_search / query. Operators
     // who want stdio to see everything should call ops directly via
     // `gbrain call <op>` (sets remote=false in src/cli.ts).
-    return dispatchToolCall(engine, name, params, {
-      remote: true,
-      takesHoldersAllowList: ['world'],
-      // v0.31: source defaults to 'default' for stdio (no per-token scope).
-      // Operators who want a different source on stdio MCP should set
-      // GBRAIN_SOURCE in the env or use --source via `gbrain call`.
-      sourceId: process.env.GBRAIN_SOURCE || 'default',
-      // v0.31 (eD3): _meta.brain_hot_memory injection so Claude Desktop /
-      // Code see the brain's relevant hot memory automatically alongside
-      // every tool-call response. Best-effort; absorbs errors.
-      metaHook: getBrainHotMemoryMeta,
-    });
+    return dispatchToolCall(
+      engine,
+      name,
+      params,
+      buildRemoteMcpDispatchOpts(process.env.GBRAIN_SOURCE || 'default'),
+    );
   });
 
   const transport = new StdioServerTransport();
@@ -159,6 +209,51 @@ export async function startMcpServer(engine: BrainEngine) {
   // closes its stdin half. Treating that as a permanent disconnect kills
   // the server before the first tool call arrives. Signal handlers and
   // transport.onclose still cover the legitimate shutdown paths.
+  if (process.env.MCP_STDIO !== '1') {
+    process.stdin.on('end', () => shutdown('stdin end'));
+    process.stdin.on('close', () => shutdown('stdin close'));
+  }
+  // @ts-ignore — SDK exposes onclose on transport
+  transport.onclose = () => shutdown('transport close');
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGHUP', () => shutdown('SIGHUP'));
+}
+
+export async function startIpcProxyMcpServer(socketPath: string) {
+  const server = new Server(
+    { name: 'gbrain', version: VERSION },
+    { capabilities: { tools: {} } },
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: buildToolDefs(operations),
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => {
+    const { name, arguments: params } = request.params;
+    try {
+      const { result } = await commandViaIpc(socketPath, {
+        callerKind: 'mcp-proxy',
+        op: name,
+        params: params || {},
+      });
+      return result as any;
+    } catch (err) {
+      throw new Error(formatProxyCommandIpcError(socketPath, err));
+    }
+  });
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+
+  let shuttingDown = false;
+  const shutdown = (reason: string, code = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    process.stderr.write(`[gbrain-serve] shutdown: ${reason}\n`);
+    process.exit(code);
+  };
   if (process.env.MCP_STDIO !== '1') {
     process.stdin.on('end', () => shutdown('stdin end'));
     process.stdin.on('close', () => shutdown('stdin close'));
