@@ -18,6 +18,85 @@ import { resolveMcpInstructions } from './instructions.ts';
 import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import { isEngineDegraded, onEngineRecovered } from '../core/degraded-marker.ts';
 import { assertStdioSourceBindable } from './source-preflight.ts';
+import {
+  commandSocketPath,
+  commandViaIpc,
+  mcpProxySocketPath,
+  cleanupStaleCommandSocket,
+  CommandIpcError,
+  type CommandIpcRequest,
+  type CommandIpcResponse,
+  startCommandIpcServer,
+} from '../core/local-command-ipc.ts';
+
+export interface LocalCommandIpcServer {
+  close(): void;
+}
+
+/** Dispatches an IPC request through the caller's explicit trust posture. */
+export async function handleCommandIpcRequest(
+  engine: BrainEngine,
+  request: CommandIpcRequest,
+  callerKind: 'trusted-cli' | 'mcp-proxy',
+): Promise<CommandIpcResponse> {
+  if (callerKind === 'trusted-cli') {
+    const result = await handleToolCall(engine, request.op, request.params || {}, { cwd: request.cwd });
+    return { result };
+  }
+  if (callerKind === 'mcp-proxy') {
+    const sourceScope = await resolveMcpStdioSourceScope(engine, request.cwd);
+    const result = await dispatchToolCall(
+      engine,
+      request.op,
+      request.params || {},
+      {
+        remote: true,
+        transport: 'stdio',
+        takesHoldersAllowList: ['world'],
+        sourceId: sourceScope.sourceId,
+        ...(sourceScope.localFederatedSourceIds
+          ? { localFederatedSourceIds: sourceScope.localFederatedSourceIds }
+          : {}),
+        metaHook: getBrainHotMemoryMeta,
+      },
+    );
+    return { result };
+  }
+  throw new CommandIpcError(
+    'protocol',
+    'Command IPC listener has an invalid caller kind.',
+    { socketPath: 'command-ipc', code: 'invalid_caller_kind' },
+  );
+}
+
+/** Start the local command endpoint owned by a PGLite serve process. */
+export async function startLocalCommandIpcServer(engine: BrainEngine): Promise<LocalCommandIpcServer | null> {
+  const cfg = loadConfig();
+  if (cfg?.engine !== 'pglite' || !cfg.database_path) return null;
+  const socketPath = commandSocketPath(cfg.database_path);
+  const server = await startCommandIpcServer(
+    socketPath,
+    'trusted-cli',
+    (request, callerKind) => handleCommandIpcRequest(engine, request, callerKind),
+  );
+  if (!server) return null;
+  const proxySocket = mcpProxySocketPath(cfg.database_path);
+  const proxyServer = await startCommandIpcServer(
+    proxySocket,
+    'mcp-proxy',
+    (request, callerKind) => handleCommandIpcRequest(engine, request, callerKind),
+  );
+  if (!proxyServer) {
+    server.close(() => { void cleanupStaleCommandSocket(socketPath); });
+    return null;
+  }
+  return {
+    close() {
+      try { server.close(() => { void cleanupStaleCommandSocket(socketPath); }); } catch { /* best effort */ }
+      try { proxyServer.close(() => { void cleanupStaleCommandSocket(proxySocket); }); } catch { /* best effort */ }
+    },
+  };
+}
 
 export async function resolveMcpStdioSourceScope(
   engine: BrainEngine,
@@ -366,6 +445,16 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     await bootEngineDependents();
   }
 
+  // Host CLI import/search/query and DB-free `serve --ipc-proxy` talk to
+  // this process so they never open a second PGLite writer. Best-effort on
+  // a direct stdio serve; `serve --local-daemon` treats bind failure as fatal.
+  let commandIpc: LocalCommandIpcServer | null = null;
+  try {
+    commandIpc = await startLocalCommandIpcServer(engine);
+  } catch {
+    /* command IPC is best-effort for direct stdio serve */
+  }
+
   // Exit cleanly when MCP client disconnects (stdin EOF) or on signals.
   // Without this, orphaned serve processes accumulate and contend for the
   // PGLite write lock, causing ingest jobs (email-sync) to time out.
@@ -375,6 +464,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     shuttingDown = true;
     process.stderr.write(`[gbrain-serve] shutdown: ${reason}\n`);
     try { startupSweep?.cancel(); } catch { /* noop */ }
+    commandIpc?.close();
     ipcBinding?.close();
     // Cathedral 5: abort the in-flight checkpoint harvest + drop its queue
     // BEFORE engine.disconnect — the background-work registry's drain is
@@ -408,6 +498,45 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   process.on('SIGHUP', () => shutdown('SIGHUP'));
 }
 
+/**
+ * DB-free stdio MCP frontend. The socket endpoint, not a caller supplied
+ * frame field, selects the untrusted MCP dispatch posture in the owner.
+ */
+export async function startIpcProxyMcpServer(
+  socketPath: string,
+  onTransportClose: () => void = () => {},
+  createTransport: () => StdioServerTransport = () => new StdioServerTransport(),
+): Promise<void> {
+  const server = new Server(
+    { name: 'gbrain', version: VERSION },
+    { capabilities: { tools: {} } },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: buildToolDefs(operations) }));
+  server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => {
+    const { name, arguments: params } = request.params;
+    try {
+      // A successful operation, including its ToolResult isError envelope,
+      // crosses unchanged. Only socket/protocol failures become proxy errors.
+      return (await commandViaIpc(socketPath, { op: name, params: params || {} })).result as any;
+    } catch (error) {
+      const detail = error instanceof CommandIpcError
+        ? { error: 'ipc_transport', reason: error.reason, code: error.code, message: error.message }
+        : { error: 'ipc_transport', message: error instanceof Error ? error.message : String(error) };
+      return { content: [{ type: 'text', text: JSON.stringify(detail) }], isError: true };
+    }
+  });
+  const transport = createTransport();
+  let transportClosed = false;
+  // The lifecycle callback is idempotent, and this local guard prevents a
+  // repeated SDK close notification from trying to tear down the proxy twice.
+  transport.onclose = () => {
+    if (transportClosed) return;
+    transportClosed = true;
+    onTransportClose();
+  };
+  await server.connect(transport);
+}
+
 // Backward compat: used by `gbrain call` command (trusted local path).
 // v0.31.8 (D22): accept opts.sourceId so `gbrain call --source X <op> <json>`
 // can scope the op handler to that source. resolveSourceWithTier() in call.ts
@@ -419,7 +548,7 @@ export async function handleToolCall(
   engine: BrainEngine,
   tool: string,
   params: Record<string, unknown>,
-  opts?: { sourceId?: string; localFederatedSourceIds?: string[] },
+  opts?: { sourceId?: string; localFederatedSourceIds?: string[]; cwd?: string },
 ): Promise<unknown> {
   const op = operations.find(o => o.name === tool);
   if (!op) throw new Error(`Unknown tool: ${tool}`);
@@ -427,13 +556,26 @@ export async function handleToolCall(
   const validationError = validateParams(op, params);
   if (validationError) throw new Error(validationError);
 
+  let sourceId = opts?.sourceId;
+  let localFederated = opts?.localFederatedSourceIds;
+  if (!sourceId) {
+    const explicit = (params.source as string | undefined) ?? null;
+    const { resolveSourceWithTier, localFederatedSourceIds } = await import('../core/source-resolver.ts');
+    try {
+      const resolved = await resolveSourceWithTier(engine, explicit, opts?.cwd);
+      sourceId = resolved.source_id;
+      localFederated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier) ?? localFederated;
+    } catch (error) {
+      if (explicit) throw error;
+      sourceId = 'default';
+    }
+  }
+
   const ctx = buildOperationContext(engine, params, {
     remote: false,
     logger: { info: console.log, warn: console.warn, error: console.error },
-    ...(opts?.sourceId ? { sourceId: opts.sourceId } : {}),
-    ...(opts?.localFederatedSourceIds
-      ? { localFederatedSourceIds: opts.localFederatedSourceIds }
-      : {}),
+    sourceId,
+    ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),
   });
 
   return op.handler(ctx, params);

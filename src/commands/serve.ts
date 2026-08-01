@@ -1,7 +1,9 @@
 import { spawnSync } from 'node:child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { isEngineDegraded as isEngineDegradedForServe } from '../core/degraded-marker.ts';
-import { startMcpServer, stdioRpcsInFlightCount } from '../mcp/server.ts';
+import { loadConfigFileOnly } from '../core/config.ts';
+import { mcpProxySocketPath, probeCommandIpc } from '../core/local-command-ipc.ts';
+import { startIpcProxyMcpServer, startLocalCommandIpcServer, startMcpServer, stdioRpcsInFlightCount } from '../mcp/server.ts';
 import { VERB_NAMES } from '../core/verbs.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
 import {
@@ -78,6 +80,8 @@ export interface ServeOptions {
   // process.stdin and would pollute the test runner's stdin handle).
   // Defaults to the real implementation when omitted.
   startMcpServer?: (engine: BrainEngine, opts?: { surface?: 'verbs' | 'starter' | 'full'; sourceGuard?: boolean }) => Promise<void>;
+  /** Test seam for the DB-free stdio MCP proxy. */
+  startIpcProxyServer?: (socketPath: string, onTransportClose: () => void) => Promise<void>;
   // Test seam for the parent-process watchdog. The default
   // (`readLiveParentPid`) reads the live kernel PPID via `ps` on POSIX
   // because `process.ppid` is captured at process creation and does not
@@ -141,6 +145,10 @@ export interface ServeOptions {
   // (pre-#4409 behavior). Defaults to GBRAIN_SERVE_EOF_DRAIN_MS (30s when
   // unset; lenient parse).
   eofDrainMs?: number;
+  /** Local-daemon stdin is not an MCP client lifecycle signal. */
+  ignoreStdinEof?: boolean;
+  /** Extra cleanup before engine.disconnect (command-IPC sockets, proxy keepalive). */
+  extraCleanup?: () => unknown;
 }
 
 /**
@@ -208,6 +216,7 @@ export async function runServe(
   // verifyAccessToken with legacy access_tokens fallback (so v0.22.7 callers
   // that used `gbrain auth create` keep working unchanged).
   const isHttp = args.includes('--http');
+  const localDaemon = args.includes('--local-daemon');
 
   // MEMORY_VERBS v1: tool-surface mode. Flag > config `mcp_surface` > 'full'.
   // 'verbs' exposes exactly the seven protocol verbs (the quickstart surface);
@@ -315,6 +324,21 @@ export async function runServe(
     return;
   }
 
+  if (localDaemon) {
+    console.error('Starting GBrain local command daemon...');
+    const localIpc = await startLocalCommandIpcServer(engine);
+    if (!localIpc) {
+      throw new Error('Could not start the local command IPC endpoints. Another daemon may already own this brain.');
+    }
+    installStdioLifecycle(engine, args, {
+      ...opts,
+      ignoreStdinEof: true,
+      extraCleanup: () => localIpc.close(),
+    });
+    await new Promise<void>(() => {});
+    return;
+  }
+
   // stdio path — install lifecycle handlers BEFORE startMcpServer so that
   // an early stdin EOF (parent died before our first read) can still
   // trigger graceful release of the PGLite write lock held by `engine`.
@@ -334,7 +358,7 @@ export async function runServe(
   // the MCP client log "Failed to parse JSONRPC message" for every line.
   redirectStdoutLoggingToStderr();
 
-  const activateStdioIdleActivityTracking = installStdioLifecycle(engine, args, opts);
+  const stdioLifecycle = installStdioLifecycle(engine, args, opts);
 
   const start = opts.startMcpServer ?? startMcpServer;
 
@@ -376,7 +400,7 @@ export async function runServe(
     // attached the MCP SDK transport listener. Attaching any `data` listener
     // earlier flips stdin into flowing mode and can consume a fast client's
     // initialize frame before the SDK sees it.
-    activateStdioIdleActivityTracking();
+    stdioLifecycle.activateIdleActivityTracking();
   } finally {
     if (bootDeadline) clearTimeout(bootDeadline);
   }
@@ -385,6 +409,41 @@ export async function runServe(
   // the event loop alive. We deliberately do NOT add `await new Promise(()
   // => {})` here — it would block this async frame and stop the lifecycle
   // hooks from being able to call process.exit() cleanly.
+}
+
+/** Start a stdio MCP frontend that never opens the local database. */
+export async function runServeIpcProxy(args: string[] = [], opts: ServeOptions = {}): Promise<void> {
+  const config = loadConfigFileOnly();
+  if (!config) throw new Error('No brain configured. Run: gbrain init');
+  if (config.engine !== 'pglite' || !config.database_path) {
+    throw new Error('gbrain serve --ipc-proxy requires a file-configured local PGLite brain.');
+  }
+  const socketPath = mcpProxySocketPath(config.database_path);
+  try {
+    await probeCommandIpc(socketPath);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${detail} Start an owner with: gbrain serve --local-daemon (or plain gbrain serve).`);
+  }
+  console.error('Starting GBrain MCP IPC proxy (stdio)...');
+  // MCP_STDIO wrappers may close their stdin half after the handshake while
+  // keeping the proxy process responsible for future MCP traffic. A pending
+  // promise does not keep Node/Bun alive, so hold one referenced handle until
+  // the normal signal or transport-close lifecycle releases it.
+  const mcpStdioMode = opts.mcpStdio ?? (process.env.MCP_STDIO === '1');
+  const keepAlive = mcpStdioMode ? setInterval(() => {}, 60_000) : null;
+  const lifecycle = installStdioLifecycle(null, args, {
+    ...opts,
+    extraCleanup: () => {
+      if (keepAlive) clearInterval(keepAlive);
+    },
+  });
+  try {
+    await (opts.startIpcProxyServer ?? startIpcProxyMcpServer)(socketPath, lifecycle.shutdownOnTransportClose);
+  } catch (error) {
+    if (keepAlive) clearInterval(keepAlive);
+    throw error;
+  }
 }
 
 // #4409: stdin-EOF drain bound. Long enough for a real tool call (a query
@@ -436,10 +495,10 @@ interface StdioLifecycleDeps {
 }
 
 function installStdioLifecycle(
-  engine: BrainEngine,
+  engine: BrainEngine | null,
   args: string[],
   opts: ServeOptions,
-): () => void {
+): { activateIdleActivityTracking: () => void; shutdownOnTransportClose: () => void } {
   const deps: StdioLifecycleDeps = {
     stdin: opts.stdin ?? process.stdin,
     signals: opts.signals ?? process,
@@ -515,7 +574,8 @@ function installStdioLifecycle(
         }
         return runner.shutdownDelegatedSync();
       })
-      .then(() => engine.disconnect())
+      .then(() => opts.extraCleanup?.())
+      .then(() => engine?.disconnect())
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         deps.log(`GBrain MCP server: cleanup error: ${msg}`);
@@ -590,7 +650,7 @@ function installStdioLifecycle(
       beginShutdown(reason);
     })();
   };
-  if (!deps.stdin.isTTY && !mcpStdioMode) {
+  if (!deps.stdin.isTTY && !mcpStdioMode && !opts.ignoreStdinEof) {
     deps.stdin.once('end', () => drainThenShutdown('stdin-end'));
     deps.stdin.once('close', () => drainThenShutdown('stdin-close'));
   }
@@ -654,7 +714,7 @@ function installStdioLifecycle(
   // it can never hold the process open. Cleared in beginShutdown. Kill
   // switch: GBRAIN_SWEEP=0 (seam: opts.sweepEnabled). Chunk-level stdin
   // 'data' granularity is sufficient — same rationale as armIdle below.
-  const sweepEnabled = opts.sweepEnabled ?? (process.env.GBRAIN_SWEEP !== '0');
+  const sweepEnabled = Boolean(engine) && (opts.sweepEnabled ?? (process.env.GBRAIN_SWEEP !== '0'));
   if (sweepEnabled) {
     const runIdleSweep = opts.sweep ?? (async (e: BrainEngine) => {
       // #4409: the runner loads lazily here too — the sweep fires after
@@ -694,7 +754,7 @@ function installStdioLifecycle(
       if (sweepInFlight) return; // never overlap sweeps
       // Degraded mode (db-availability 4c): background sweeps must not burn
       // the min-interval reconnect budget — tool calls own recovery.
-      if (isEngineDegradedForServe(engine)) return;
+      if (!engine || isEngineDegradedForServe(engine)) return;
       sweepInFlight = true;
       Promise.resolve()
         .then(() => runIdleSweep(engine))
@@ -741,7 +801,10 @@ function installStdioLifecycle(
     deps.log(`GBrain MCP server: stdio idle timeout = ${idleTimeoutSec}s`);
   }
 
-  return activateIdleActivityTracking;
+  return {
+    activateIdleActivityTracking,
+    shutdownOnTransportClose: () => beginShutdown('transport-close'),
+  };
 }
 
 /**
