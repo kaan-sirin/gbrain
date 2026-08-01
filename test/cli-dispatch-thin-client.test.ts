@@ -141,6 +141,21 @@ describe('thin-client dispatch guard does NOT refuse safe commands', () => {
   });
 });
 
+describe('host-only local command IPC serve modes', () => {
+  test('refuses explicit mounted brains before starting either host IPC serve mode', async () => {
+    seedLocalPGLiteConfig();
+    for (const args of [
+      ['serve', '--local-daemon', '--brain', 'mounted-brain'],
+      ['serve', '--ipc-proxy', '--brain', 'mounted-brain'],
+    ]) {
+      const result = await run(args);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('host-only');
+      expect(result.stderr).toContain('mounted brain');
+    }
+  });
+});
+
 describe('thin-client doctor routes to runRemoteDoctor', () => {
   test('`gbrain doctor` runs remote checks (not DB-bound checks) when remote_mcp is set', async () => {
     seedThinClientConfig();

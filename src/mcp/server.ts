@@ -14,6 +14,96 @@ import {
   cleanupStaleSocket,
 } from '../core/context/resolve-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
+import {
+  commandSocketPath,
+  commandViaIpc,
+  mcpProxySocketPath,
+  cleanupStaleCommandSocket,
+  CommandIpcError,
+  type CommandIpcRequest,
+  type CommandIpcResponse,
+  startCommandIpcServer,
+} from '../core/local-command-ipc.ts';
+
+export interface LocalCommandIpcServer {
+  close(): void;
+}
+
+async function localFederatedDispatchOpts(engine: BrainEngine, sourceId: string) {
+  let localFederated: string[] | undefined;
+  try {
+    const { localFederatedSourceIds } = await import('../core/source-resolver.ts');
+    localFederated = await localFederatedSourceIds(
+      engine,
+      sourceId,
+      process.env.GBRAIN_SOURCE ? 'env' : 'seed_default',
+    );
+  } catch { /* scalar scope stands */ }
+  return {
+    remote: true as const,
+    transport: 'stdio' as const,
+    takesHoldersAllowList: ['world'],
+    sourceId,
+    ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),
+    metaHook: getBrainHotMemoryMeta,
+  };
+}
+
+/** Dispatches an IPC request through the caller's explicit trust posture. */
+export async function handleCommandIpcRequest(
+  engine: BrainEngine,
+  request: CommandIpcRequest,
+  callerKind: 'trusted-cli' | 'mcp-proxy',
+): Promise<CommandIpcResponse> {
+  if (callerKind === 'trusted-cli') {
+    const result = await handleToolCall(engine, request.op, request.params || {}, { cwd: request.cwd });
+    return { result };
+  }
+  if (callerKind === 'mcp-proxy') {
+    const sourceId = process.env.GBRAIN_SOURCE || 'default';
+    const result = await dispatchToolCall(
+      engine,
+      request.op,
+      request.params || {},
+      await localFederatedDispatchOpts(engine, sourceId),
+    );
+    return { result };
+  }
+  throw new CommandIpcError(
+    'protocol',
+    'Command IPC listener has an invalid caller kind.',
+    { socketPath: 'command-ipc', code: 'invalid_caller_kind' },
+  );
+}
+
+/** Start the local command endpoint owned by a PGLite serve process. */
+export async function startLocalCommandIpcServer(engine: BrainEngine): Promise<LocalCommandIpcServer | null> {
+  const cfg = loadConfig();
+  if (cfg?.engine !== 'pglite' || !cfg.database_path) return null;
+  const socketPath = commandSocketPath(cfg.database_path);
+  const server = await startCommandIpcServer(
+    socketPath,
+    'trusted-cli',
+    (request, callerKind) => handleCommandIpcRequest(engine, request, callerKind),
+  );
+  if (!server) return null;
+  const proxySocket = mcpProxySocketPath(cfg.database_path);
+  const proxyServer = await startCommandIpcServer(
+    proxySocket,
+    'mcp-proxy',
+    (request, callerKind) => handleCommandIpcRequest(engine, request, callerKind),
+  );
+  if (!proxyServer) {
+    server.close(() => { void cleanupStaleCommandSocket(socketPath); });
+    return null;
+  }
+  return {
+    close() {
+      try { server.close(() => { void cleanupStaleCommandSocket(socketPath); }); } catch { /* best effort */ }
+      try { proxyServer.close(() => { void cleanupStaleCommandSocket(proxySocket); }); } catch { /* best effort */ }
+    },
+  };
+}
 
 export async function startMcpServer(engine: BrainEngine) {
   const server = new Server(
@@ -40,37 +130,15 @@ export async function startMcpServer(engine: BrainEngine) {
     // as unqualified local CLI reads). GBRAIN_SOURCE set = explicit scope,
     // no widening. Best-effort: a resolver failure keeps the scalar scope.
     // ponytail: one tiny SELECT per tool call; cache it if it ever shows up.
-    let localFederated: string[] | undefined;
-    try {
-      const { localFederatedSourceIds } = await import('../core/source-resolver.ts');
-      localFederated = await localFederatedSourceIds(
-        engine,
-        process.env.GBRAIN_SOURCE || 'default',
-        process.env.GBRAIN_SOURCE ? 'env' : 'seed_default',
-      );
-    } catch { /* scalar scope stands */ }
     // v0.28: stdio MCP has no per-token auth (local pipe). Default the
     // takes-holder allow-list to ['world'] so agent-facing callers don't
     // see private hunches via takes_list / takes_search / query. Operators
     // who want stdio to see everything should call ops directly via
     // `gbrain call <op>` (sets remote=false in src/cli.ts).
-    return dispatchToolCall(engine, name, params, {
-      remote: true,
-      // #1061: mark the transport so whoami can report {transport: 'stdio'}
-      // instead of throwing unknown_transport. Trust posture unchanged —
-      // stdio stays remote/untrusted.
-      transport: 'stdio',
-      takesHoldersAllowList: ['world'],
-      // v0.31: source defaults to 'default' for stdio (no per-token scope).
-      // Operators who want a different source on stdio MCP should set
-      // GBRAIN_SOURCE in the env or use --source via `gbrain call`.
-      sourceId: process.env.GBRAIN_SOURCE || 'default',
-      ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),
-      // v0.31 (eD3): _meta.brain_hot_memory injection so Claude Desktop /
-      // Code see the brain's relevant hot memory automatically alongside
-      // every tool-call response. Best-effort; absorbs errors.
-      metaHook: getBrainHotMemoryMeta,
-    });
+    return dispatchToolCall(engine, name, params, await localFederatedDispatchOpts(
+      engine,
+      process.env.GBRAIN_SOURCE || 'default',
+    ));
   });
 
   const transport = new StdioServerTransport();
@@ -82,6 +150,7 @@ export async function startMcpServer(engine: BrainEngine) {
   // Best-effort; failure to bind never blocks the MCP server.
   let resolveServer: import('node:net').Server | null = null;
   let resolveSocket: string | null = null;
+  let commandIpc: LocalCommandIpcServer | null = null;
   try {
     const cfg = loadConfig();
     if (cfg?.engine === 'pglite' && cfg.database_path) {
@@ -110,6 +179,11 @@ export async function startMcpServer(engine: BrainEngine) {
   } catch {
     /* resolve IPC is best-effort; never block serve */
   }
+  try {
+    commandIpc = await startLocalCommandIpcServer(engine);
+  } catch {
+    /* command IPC is best-effort for direct stdio serve */
+  }
 
   // Exit cleanly when MCP client disconnects (stdin EOF) or on signals.
   // Without this, orphaned serve processes accumulate and contend for the
@@ -120,6 +194,7 @@ export async function startMcpServer(engine: BrainEngine) {
     shuttingDown = true;
     process.stderr.write(`[gbrain-serve] shutdown: ${reason}\n`);
     try { resolveServer?.close(); } catch { /* noop */ }
+    commandIpc?.close();
     if (resolveSocket) cleanupStaleSocket(resolveSocket);
     Promise.resolve(engine.disconnect?.())
       .catch(() => {})
@@ -141,6 +216,45 @@ export async function startMcpServer(engine: BrainEngine) {
   process.on('SIGHUP', () => shutdown('SIGHUP'));
 }
 
+/**
+ * DB-free stdio MCP frontend. The socket endpoint, not a caller supplied
+ * frame field, selects the untrusted MCP dispatch posture in the owner.
+ */
+export async function startIpcProxyMcpServer(
+  socketPath: string,
+  onTransportClose: () => void = () => {},
+  createTransport: () => StdioServerTransport = () => new StdioServerTransport(),
+): Promise<void> {
+  const server = new Server(
+    { name: 'gbrain', version: VERSION },
+    { capabilities: { tools: {} } },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: buildToolDefs(operations) }));
+  server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => {
+    const { name, arguments: params } = request.params;
+    try {
+      // A successful operation, including its ToolResult isError envelope,
+      // crosses unchanged. Only socket/protocol failures become proxy errors.
+      return (await commandViaIpc(socketPath, { op: name, params: params || {} })).result as any;
+    } catch (error) {
+      const detail = error instanceof CommandIpcError
+        ? { error: 'ipc_transport', reason: error.reason, code: error.code, message: error.message }
+        : { error: 'ipc_transport', message: error instanceof Error ? error.message : String(error) };
+      return { content: [{ type: 'text', text: JSON.stringify(detail) }], isError: true };
+    }
+  });
+  const transport = createTransport();
+  let transportClosed = false;
+  // The lifecycle callback is idempotent, and this local guard prevents a
+  // repeated SDK close notification from trying to tear down the proxy twice.
+  transport.onclose = () => {
+    if (transportClosed) return;
+    transportClosed = true;
+    onTransportClose();
+  };
+  await server.connect(transport);
+}
+
 // Backward compat: used by `gbrain call` command (trusted local path).
 // v0.31.8 (D22): accept opts.sourceId so `gbrain call --source X <op> <json>`
 // can scope the op handler to that source. resolveSourceId() in call.ts is
@@ -149,7 +263,7 @@ export async function handleToolCall(
   engine: BrainEngine,
   tool: string,
   params: Record<string, unknown>,
-  opts?: { sourceId?: string },
+  opts?: { sourceId?: string; cwd?: string },
 ): Promise<unknown> {
   const op = operations.find(o => o.name === tool);
   if (!op) throw new Error(`Unknown tool: ${tool}`);
@@ -157,10 +271,25 @@ export async function handleToolCall(
   const validationError = validateParams(op, params);
   if (validationError) throw new Error(validationError);
 
+  let sourceId = opts?.sourceId;
+  let localFederated: string[] | undefined;
+  if (!sourceId) {
+    const explicit = (params.source as string | undefined) ?? null;
+    const { resolveSourceWithTier, localFederatedSourceIds } = await import('../core/source-resolver.ts');
+    try {
+      const resolved = await resolveSourceWithTier(engine, explicit, opts?.cwd);
+      sourceId = resolved.source_id;
+      localFederated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
+    } catch (error) {
+      if (explicit) throw error;
+      sourceId = 'default';
+    }
+  }
   const ctx = buildOperationContext(engine, params, {
     remote: false,
     logger: { info: console.log, warn: console.warn, error: console.error },
-    ...(opts?.sourceId ? { sourceId: opts.sourceId } : {}),
+    sourceId,
+    ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),
   });
 
   return op.handler(ctx, params);

@@ -333,6 +333,32 @@ async function main() {
     return;
   }
 
+  // The proxy is intentionally handled before CLI-only dispatch and before
+  // connectEngine: it is a DB-free stdio process talking to a local owner.
+  if (command === 'serve' && subArgs.includes('--ipc-proxy')) {
+    const { resolveBrainId } = await import('./core/brain-resolver.ts');
+    if (resolveBrainId(cliOpts.brain) !== 'host') {
+      throw new Error('gbrain serve --ipc-proxy is host-only; a mounted brain has no host command IPC endpoint. Remove --brain (and any ambient mount selection).');
+    }
+    const fileConfig = loadConfigFileOnly();
+    if (isThinClient(fileConfig)) {
+      throw new Error('gbrain serve --ipc-proxy is unavailable on a thin-client install; it has no local PGLite owner.');
+    }
+    const { runServeIpcProxy } = await import('./commands/serve.ts');
+    await runServeIpcProxy(subArgs);
+    return;
+  }
+
+  // A local daemon owns the host config's PGLite database and its two socket
+  // paths. Binding those host paths while --brain resolves to a mount would
+  // silently expose the wrong engine, so refuse before the engine router.
+  if (command === 'serve' && subArgs.includes('--local-daemon')) {
+    const { resolveBrainId } = await import('./core/brain-resolver.ts');
+    if (resolveBrainId(cliOpts.brain) !== 'host') {
+      throw new Error('gbrain serve --local-daemon is host-only; it cannot own a mounted brain through the host socket paths. Remove --brain (and any ambient mount selection).');
+    }
+  }
+
   // CLI-only commands
   if (CLI_ONLY.has(command)) {
     await handleCliOnly(command, subArgs);
@@ -427,6 +453,38 @@ async function main() {
     }
     await runThinClientRouted(op, params, cfgPre!, cliOpts);
     return;
+  }
+
+  // A live local PGLite owner can execute shared CLI operations without a
+  // second process opening the single-writer database. Thin clients above
+  // retain their remote-MCP route, and mounts never route to the host socket.
+  const { resolveBrainId } = await import('./core/brain-resolver.ts');
+  if (
+    process.env.GBRAIN_COMMAND_IPC !== '0' &&
+    cfgPre?.engine === 'pglite' &&
+    cfgPre.database_path &&
+    resolveBrainId(cliOpts.brain) === 'host'
+  ) {
+    const { commandSocketPath, commandViaIpc, CommandIpcError, isCommandIpcUnavailableError } = await import('./core/local-command-ipc.ts');
+    try {
+      const delegated = await commandViaIpc(commandSocketPath(cfgPre.database_path), {
+        op: op.name,
+        params,
+        cwd: process.cwd(),
+      });
+      const output = formatResult(op.name, delegated.result);
+      if (output) process.stdout.write(output);
+      return;
+    } catch (error) {
+      if (!isCommandIpcUnavailableError(error)) {
+        if (error instanceof CommandIpcError && error.reason === 'operation') {
+          console.error(error.code ? `Error [${error.code}]: ${error.message}` : error.message);
+          setCliExitVerdict(1);
+          return;
+        }
+        throw error;
+      }
+    }
   }
 
   // Local engine path (unchanged behavior for local installs).
@@ -2729,6 +2787,8 @@ ADMIN
   storage status [--repo <path>]     Storage tier status and health
         [--json]                     (git-tracked vs supabase-only)
   serve                              MCP server (stdio)
+  serve --local-daemon               Local PGLite command owner (no stdio MCP)
+  serve --ipc-proxy                  DB-free stdio MCP frontend for a local owner
   serve --http [--port N]            HTTP MCP server with OAuth 2.1
     --token-ttl N                    Access token TTL in seconds (default: 3600)
     --enable-dcr                     Enable Dynamic Client Registration (DCR clients default to authorization_code)

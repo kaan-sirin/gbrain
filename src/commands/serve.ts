@@ -1,6 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import type { BrainEngine } from '../core/engine.ts';
-import { startMcpServer } from '../mcp/server.ts';
+import { loadConfigFileOnly } from '../core/config.ts';
+import { mcpProxySocketPath, probeCommandIpc } from '../core/local-command-ipc.ts';
+import { startIpcProxyMcpServer, startLocalCommandIpcServer, startMcpServer } from '../mcp/server.ts';
 
 // Maximum time the stdio path will wait for engine.disconnect() (PGLite
 // close + advisory lock release) before forcing exit. Keeps a wedged
@@ -45,6 +47,8 @@ export interface ServeOptions {
   // process.stdin and would pollute the test runner's stdin handle).
   // Defaults to the real implementation when omitted.
   startMcpServer?: (engine: BrainEngine) => Promise<void>;
+  /** Test seam for the DB-free stdio MCP proxy. */
+  startIpcProxyServer?: (socketPath: string, onTransportClose: () => void) => Promise<void>;
   // Test seam for the parent-process watchdog. The default
   // (`readLiveParentPid`) reads the live kernel PPID via `ps` on POSIX
   // because `process.ppid` is captured at process creation and does not
@@ -82,6 +86,8 @@ export interface ServeOptions {
   // Defaults to GBRAIN_SERVE_BOOT_TIMEOUT_SECONDS (seconds; 60 when
   // unset, 0 disables) when omitted.
   bootTimeoutMs?: number;
+  /** Local-daemon stdin is not an MCP client lifecycle signal. */
+  ignoreStdinEof?: boolean;
 }
 
 /**
@@ -149,6 +155,7 @@ export async function runServe(
   // verifyAccessToken with legacy access_tokens fallback (so v0.22.7 callers
   // that used `gbrain auth create` keep working unchanged).
   const isHttp = args.includes('--http');
+  const localDaemon = args.includes('--local-daemon');
 
   if (isHttp) {
     const portIdx = args.indexOf('--port');
@@ -202,6 +209,24 @@ export async function runServe(
     return;
   }
 
+  if (localDaemon) {
+    console.error('Starting GBrain local command daemon...');
+    const localIpc = await startLocalCommandIpcServer(engine);
+    if (!localIpc) {
+      throw new Error('Could not start the local command IPC endpoints. Another daemon may already own this brain.');
+    }
+    installStdioLifecycle(
+      async () => {
+        localIpc.close();
+        await engine.disconnect();
+      },
+      args,
+      { ...opts, ignoreStdinEof: true },
+    );
+    await new Promise<void>(() => {});
+    return;
+  }
+
   // stdio path — install lifecycle handlers BEFORE startMcpServer so that
   // an early stdin EOF (parent died before our first read) can still
   // trigger graceful release of the PGLite write lock held by `engine`.
@@ -209,7 +234,7 @@ export async function runServe(
   // and is intentionally NOT wired into this stdio plumbing.
   console.error('Starting GBrain MCP server (stdio)...');
 
-  installStdioLifecycle(engine, args, opts);
+  installStdioLifecycle(() => engine.disconnect(), args, opts);
 
   const start = opts.startMcpServer ?? startMcpServer;
 
@@ -256,6 +281,38 @@ export async function runServe(
   // hooks from being able to call process.exit() cleanly.
 }
 
+/** Start a stdio MCP frontend that never opens the local database. */
+export async function runServeIpcProxy(args: string[] = [], opts: ServeOptions = {}): Promise<void> {
+  const config = loadConfigFileOnly();
+  if (!config) throw new Error('No brain configured. Run: gbrain init');
+  if (config.engine !== 'pglite' || !config.database_path) {
+    throw new Error('gbrain serve --ipc-proxy requires a file-configured local PGLite brain.');
+  }
+  const socketPath = mcpProxySocketPath(config.database_path);
+  try {
+    await probeCommandIpc(socketPath);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${detail} Start an owner with: gbrain serve --local-daemon (or plain gbrain serve).`);
+  }
+  console.error('Starting GBrain MCP IPC proxy (stdio)...');
+  // MCP_STDIO wrappers may close their stdin half after the handshake while
+  // keeping the proxy process responsible for future MCP traffic. A pending
+  // promise does not keep Node/Bun alive, so hold one referenced handle until
+  // the normal signal or transport-close lifecycle releases it.
+  const mcpStdioMode = opts.mcpStdio ?? (process.env.MCP_STDIO === '1');
+  const keepAlive = mcpStdioMode ? setInterval(() => {}, 60_000) : null;
+  const shutdownOnTransportClose = installStdioLifecycle(async () => {
+    if (keepAlive) clearInterval(keepAlive);
+  }, args, opts);
+  try {
+    await (opts.startIpcProxyServer ?? startIpcProxyMcpServer)(socketPath, shutdownOnTransportClose);
+  } catch (error) {
+    if (keepAlive) clearInterval(keepAlive);
+    throw error;
+  }
+}
+
 // Env resolution for the boot deadline. Lenient (warn + default) rather
 // than throw: this is an incident-time escape hatch, and a typo'd env var
 // must not turn a boot-safety net into a boot failure of its own.
@@ -284,10 +341,10 @@ interface StdioLifecycleDeps {
 }
 
 function installStdioLifecycle(
-  engine: BrainEngine,
+  cleanup: () => Promise<unknown>,
   args: string[],
   opts: ServeOptions,
-): void {
+): () => void {
   const deps: StdioLifecycleDeps = {
     stdin: opts.stdin ?? process.stdin,
     signals: opts.signals ?? process,
@@ -330,7 +387,7 @@ function installStdioLifecycle(
     deadline.unref?.();
 
     Promise.resolve()
-      .then(() => engine.disconnect())
+      .then(() => cleanup())
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         deps.log(`GBrain MCP server: cleanup error: ${msg}`);
@@ -368,7 +425,7 @@ function installStdioLifecycle(
   // `mcpStdio` is the injectable form; default reads the env once at
   // install time so tests stay isolated (no process.env mutation).
   const mcpStdioMode = opts.mcpStdio ?? (process.env.MCP_STDIO === '1');
-  if (!deps.stdin.isTTY && !mcpStdioMode) {
+  if (!deps.stdin.isTTY && !mcpStdioMode && !opts.ignoreStdinEof) {
     deps.stdin.once('end', () => beginShutdown('stdin-end'));
     deps.stdin.once('close', () => beginShutdown('stdin-close'));
   }
@@ -450,6 +507,11 @@ function installStdioLifecycle(
     deps.stdin.on('data', armIdle);
     deps.log(`GBrain MCP server: stdio idle timeout = ${idleTimeoutSec}s`);
   }
+
+  // The MCP SDK reports an explicit transport close independently from stdin
+  // EOF. This matters in MCP_STDIO mode, where EOF can be only a wrapper's
+  // one-way handshake close and must remain non-terminal.
+  return () => beginShutdown('transport-close');
 }
 
 /**
