@@ -22,7 +22,9 @@ Key files:
   non-TTY default). Exhaustive TS `never` switch on `RemoteMcpError.reason`
   for canned, actionable error messages. ENG-2 renderer parity: local-engine
   path runs `JSON.parse(JSON.stringify(result))` so renderers see the same
-  shape on both paths (kills Date/bigint/Buffer drift class).
+  shape on both paths (kills Date/bigint/Buffer drift class). Local PGLite
+  command IPC is considered only after the thin-client branch and only for the
+  host brain, so a remote install or mount cannot be redirected to a host daemon.
 - `src/core/mcp-client.ts` — `callRemoteTool(config, toolName, args, opts)`.
   Hardened in v0.31.1 (CDX-4): all transport errors normalized to
   `RemoteMcpError` via the `toRemoteMcpError` funnel. New `CallRemoteToolOptions
