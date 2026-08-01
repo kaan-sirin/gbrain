@@ -35,7 +35,9 @@ carries the routing-seam picture):
   non-TTY default). Exhaustive TS `never` switch on `RemoteMcpError.reason`
   for canned, actionable error messages. Renderer parity: the local-engine
   path runs `JSON.parse(JSON.stringify(result))` so renderers see the same
-  shape on both paths (kills the Date/bigint/Buffer drift class).
+  shape on both paths (kills the Date/bigint/Buffer drift class). Local PGLite
+  command IPC is considered only after the thin-client branch and only for the
+  host brain, so a remote install or mount cannot be redirected to a host daemon.
 - `src/core/mcp-client.ts` — `callRemoteTool(config, toolName, args, opts)`,
   the transport under the routing seam. All transport errors normalize to
   `RemoteMcpError` via the `toRemoteMcpError` funnel, with a stable
