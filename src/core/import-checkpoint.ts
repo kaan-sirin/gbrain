@@ -55,8 +55,8 @@ export const IMPORT_CHECKPOINT_KIND = 'import';
  * made the checkpoint `dir` resolve to whatever CWD the NEXT consumer ran
  * from, which downstream tooling treated as an owned staging directory).
  */
-export function resolveImportTargetDir(dir: string): string {
-  return realpathSync(resolve(dir));
+export function resolveImportTargetDir(dir: string, cwd = process.cwd()): string {
+  return realpathSync(resolve(cwd, dir));
 }
 
 /**

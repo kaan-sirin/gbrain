@@ -71,6 +71,8 @@ export async function runImport(
      * `wiki/page1` consistently across full and incremental sync.
      */
     slugRoot?: string;
+    /** Caller working directory when import runs through the local daemon. */
+    cwd?: string;
   } = {},
 ): Promise<RunImportResult> {
   const noEmbed = args.includes('--no-embed');
@@ -90,7 +92,7 @@ export async function runImport(
     } catch (e) {
       console.error(`\n${e instanceof Error ? e.message : e}`);
       console.error('Tip: run `gbrain import <dir> --no-embed` to import without embedding now.');
-      process.exit(1);
+      throw e;
     }
 
     // v0.41.6.0 D1: preflight embedding credentials. Closes the bug class
@@ -108,7 +110,7 @@ export async function runImport(
           console.error(e.userMessage);
           console.error('');
         }
-        process.exit(1);
+        throw e;
       }
       throw e;
     }
@@ -157,10 +159,10 @@ export async function runImport(
   // see no behavior change.
   if (!sourceId && process.env.GBRAIN_SOURCE) {
     const { resolveSourceId } = await import('../core/source-resolver.ts');
-    sourceId = await resolveSourceId(engine, null);
+    sourceId = await resolveSourceId(engine, null, opts.cwd);
   } else if (!sourceId) {
     const { resolveSourceWithTier, formatSoleNonDefaultNudge } = await import('../core/source-resolver.ts');
-    const resolved = await resolveSourceWithTier(engine, null);
+    const resolved = await resolveSourceWithTier(engine, null, opts.cwd);
     // Only adopt the resolution when it improves on the seed_default
     // fallback — that preserves the v0.30.x "default-only when unset"
     // contract for the common case AND opens the sole_non_default
@@ -181,8 +183,7 @@ export async function runImport(
   try {
     workerCount = parseWorkers(workersArg ?? undefined) ?? 1;
   } catch (e) {
-    console.error(e instanceof Error ? e.message : String(e));
-    process.exit(1);
+    throw e;
   }
   // Find dir: first non-flag arg that isn't a value for --workers
   const flagValues = new Set<number>();
@@ -191,8 +192,7 @@ export async function runImport(
   const dirArg = args.find((a, i) => !a.startsWith('--') && !flagValues.has(i));
 
   if (!dirArg) {
-    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--include-gitignored] [--json]');
-    process.exit(1);
+    throw new Error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--include-gitignored] [--json]');
   }
   // #1728: capture the import target ONCE as an absolute real path. Every
   // downstream consumer of `dir` (collection, checkpoint load/save, resume
@@ -201,11 +201,10 @@ export async function runImport(
   // resolve against whatever CWD a later process happens to run from.
   let dir: string;
   try {
-    dir = resolveImportTargetDir(dirArg);
+    dir = resolveImportTargetDir(dirArg, opts.cwd);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    console.error(`Import target is not readable: ${dirArg} (${msg})`);
-    process.exit(1);
+    throw new Error(`Import target is not readable: ${dirArg} (${msg})`);
   }
 
   // v0.31.2: collect under the right strategy. Pre-fix this called

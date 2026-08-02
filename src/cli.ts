@@ -359,6 +359,60 @@ async function main() {
     }
   }
 
+  // Import is CLI-only, so it cannot use the shared operation router below.
+  // Delegate it explicitly when the host PGLite daemon owns the database.
+  if (command === 'import' && process.env.GBRAIN_IMPORT_IPC !== '0') {
+    const { resolveBrainId } = await import('./core/brain-resolver.ts');
+    const fileConfig = loadConfigFileOnly();
+    if (
+      !isThinClient(fileConfig) &&
+      fileConfig?.engine === 'pglite' &&
+      fileConfig.database_path &&
+      resolveBrainId(cliOpts.brain) === 'host'
+    ) {
+      const {
+        commandSocketPath,
+        commandViaIpc,
+        CommandIpcError,
+        isCommandIpcUnavailableError,
+        LOCAL_CLI_IMPORT_OP,
+        LOCAL_CLI_IMPORT_TIMEOUT_MS,
+      } = await import('./core/local-command-ipc.ts');
+      try {
+        const delegated = await commandViaIpc(
+          commandSocketPath(fileConfig.database_path),
+          { op: LOCAL_CLI_IMPORT_OP, params: { args: subArgs }, cwd: process.cwd() },
+          LOCAL_CLI_IMPORT_TIMEOUT_MS,
+        );
+        const result = delegated.result as import('./commands/import.ts').RunImportResult;
+        if (subArgs.includes('--json')) {
+          console.log(JSON.stringify({
+            status: result.errors > 0 ? 'completed_with_errors' : 'success',
+            imported: result.imported,
+            skipped: result.skipped,
+            errors: result.errors,
+            chunks: result.chunksCreated,
+            failures: result.failures,
+          }));
+        } else {
+          console.log('Delegated import to the running gbrain daemon.');
+          console.log(`Imported ${result.imported} pages; skipped ${result.skipped}; ${result.errors} errors; ${result.chunksCreated} chunks created.`);
+        }
+        if (result.errors > 0) setCliExitVerdict(1);
+        return;
+      } catch (error) {
+        if (!isCommandIpcUnavailableError(error)) {
+          if (error instanceof CommandIpcError && error.reason === 'operation') {
+            console.error(error.code ? `Error [${error.code}]: ${error.message}` : error.message);
+            setCliExitVerdict(1);
+            return;
+          }
+          throw error;
+        }
+      }
+    }
+  }
+
   // CLI-only commands
   if (CLI_ONLY.has(command)) {
     await handleCliOnly(command, subArgs);

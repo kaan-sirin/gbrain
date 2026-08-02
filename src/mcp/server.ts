@@ -2,7 +2,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { BrainEngine } from '../core/engine.ts';
-import { operations } from '../core/operations.ts';
+import { OperationError, operations } from '../core/operations.ts';
 import { VERSION } from '../version.ts';
 import { buildToolDefs } from './tool-defs.ts';
 import { dispatchToolCall, validateParams, buildOperationContext } from './dispatch.ts';
@@ -20,6 +20,8 @@ import {
   mcpProxySocketPath,
   cleanupStaleCommandSocket,
   CommandIpcError,
+  LOCAL_CLI_IMPORT_OP,
+  LOCAL_CLI_IMPORT_TIMEOUT_MS,
   type CommandIpcRequest,
   type CommandIpcResponse,
   startCommandIpcServer,
@@ -56,6 +58,19 @@ export async function handleCommandIpcRequest(
   callerKind: 'trusted-cli' | 'mcp-proxy',
 ): Promise<CommandIpcResponse> {
   if (callerKind === 'trusted-cli') {
+    if (request.op === LOCAL_CLI_IMPORT_OP) {
+      const args = request.params.args;
+      if (!Array.isArray(args) || !args.every((arg): arg is string => typeof arg === 'string')) {
+        throw new OperationError('invalid_params', 'Local import IPC requires params.args to be an array of strings.');
+      }
+      try {
+        const { runImport } = await import('../commands/import.ts');
+        return { result: await runImport(engine, args, { cwd: request.cwd }) };
+      } catch (error) {
+        if (error instanceof OperationError) throw error;
+        throw new OperationError('import_failed', error instanceof Error ? error.message : String(error));
+      }
+    }
     const result = await handleToolCall(engine, request.op, request.params || {}, { cwd: request.cwd });
     return { result };
   }
@@ -85,6 +100,7 @@ export async function startLocalCommandIpcServer(engine: BrainEngine): Promise<L
     socketPath,
     'trusted-cli',
     (request, callerKind) => handleCommandIpcRequest(engine, request, callerKind),
+    { requestTimeoutMs: LOCAL_CLI_IMPORT_TIMEOUT_MS },
   );
   if (!server) return null;
   const proxySocket = mcpProxySocketPath(cfg.database_path);
