@@ -36,6 +36,11 @@ import { computePoolBudgetCheck } from '../src/commands/doctor.ts';
 
 let engine: PGLiteEngine;
 let repoPath: string;
+// Blocked runs write to the file-plane sync-failure ledger. Isolate that
+// operator state per test so the notes/bad.md fixture never escapes into the
+// developer's real ~/.gbrain/sync-failures.jsonl.
+let testHome: string;
+const originalGbrainHome = process.env.GBRAIN_HOME;
 
 function gitInit(repo: string): void {
   execSync('git init', { cwd: repo, stdio: 'pipe' });
@@ -93,6 +98,8 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
   }, 60_000);
 
   beforeEach(async () => {
+    testHome = mkdtempSync(join(tmpdir(), 'gbrain-1794-home-'));
+    process.env.GBRAIN_HOME = testHome;
     await resetPgliteState(engine);
     repoPath = mkdtempSync(join(tmpdir(), 'gbrain-1794-'));
     gitInit(repoPath);
@@ -102,6 +109,9 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
 
   afterEach(() => {
     delete process.env.GBRAIN_SYNC_CHECKPOINT_EVERY;
+    if (originalGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+    else process.env.GBRAIN_HOME = originalGbrainHome;
+    if (testHome) rmSync(testHome, { recursive: true, force: true });
     if (repoPath) rmSync(repoPath, { recursive: true, force: true });
   });
 
