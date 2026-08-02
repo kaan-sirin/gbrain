@@ -30,7 +30,8 @@ import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unl
 import { dirname, join } from 'node:path';
 import { gbrainPath } from './config.ts';
 import { acquirePackLock, type PackLockOpts } from './schema-pack/pack-lock.ts';
-import { isValidVersionString, parseSemver, semverGt, semverLte } from './semver.ts';
+import { isNewerVersion, isValidVersionString, parseSemver, semverGt, semverLte } from './semver.ts';
+import { VERSION } from '../version.ts';
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -286,7 +287,16 @@ function atomicWrite(path: string, content: string): void {
   renameSync(tmp, path);
 }
 
-/** Read + strict-parse the cache. Returns null on missing / corrupt. */
+/**
+ * Read + strict-parse the cache. Returns null on missing / corrupt.
+ *
+ * An upgrade marker is only actionable while its `latest` version is newer
+ * than the binary reading it. This matters when gbrain is upgraded by a
+ * package manager or deployment script instead of `gbrain self-upgrade`: the
+ * old cache file survives, and a failed refresh must not keep advertising an
+ * upgrade that has already happened. Normalize that obsolete marker in memory
+ * so every cache consumer gets the same monotonic answer.
+ */
 export function readUpdateCache(): CacheEntry | null {
   const path = updateCachePath();
   let content: string;
@@ -299,6 +309,13 @@ export function readUpdateCache(): CacheEntry | null {
   }
   const marker = parseMarker(content);
   if (!marker) return null;
+  if (
+    marker.kind === 'upgrade_available' &&
+    marker.latest &&
+    !isNewerVersion(VERSION, marker.latest)
+  ) {
+    return { marker: { kind: 'up_to_date', current: VERSION }, mtimeMs };
+  }
   return { marker, mtimeMs };
 }
 

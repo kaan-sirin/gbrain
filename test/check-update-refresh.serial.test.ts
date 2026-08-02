@@ -155,6 +155,13 @@ describe('refreshUpdateCache — full refresh orchestration (network stubbed)', 
     expect(readUpdateCache()?.marker).toEqual({ kind: 'upgrade_available', current: VERSION, latest });
   });
 
+  test('network failure does not preserve an upgrade marker the running binary already reached', async () => {
+    writeUpdateCache({ kind: 'upgrade_available', current: '0.42.71.0', latest: VERSION });
+    stubVersionFetch(null);
+    await refreshUpdateCache();
+    expect(readUpdateCache()?.marker).toEqual({ kind: 'up_to_date', current: VERSION });
+  });
+
   test('non-OK HTTP → no fabricated up_to_date', async () => {
     stubVersionFetch('nope', 500);
     await refreshUpdateCache();
