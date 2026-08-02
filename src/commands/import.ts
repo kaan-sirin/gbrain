@@ -198,6 +198,8 @@ export async function runImport(
      * `wiki/page1` consistently across full and incremental sync.
      */
     slugRoot?: string;
+    /** Caller working directory when import runs through the local daemon. */
+    cwd?: string;
   } = {},
 ): Promise<RunImportResult> {
   const noEmbed = args.includes('--no-embed');
@@ -332,7 +334,7 @@ export async function runImport(
   // see no behavior change.
   if (!sourceId && process.env.GBRAIN_SOURCE) {
     const { resolveSourceId } = await import('../core/source-resolver.ts');
-    sourceId = await resolveSourceId(engine, null);
+    sourceId = await resolveSourceId(engine, null, opts.cwd);
   } else if (!sourceId) {
     const {
       resolveSourceWithTier,
@@ -341,7 +343,7 @@ export async function runImport(
       assessDefaultWriteGuardOnce,
       formatDefaultWriteWarning,
     } = await import('../core/source-resolver.ts');
-    const resolved = await resolveSourceWithTier(engine, null);
+    const resolved = await resolveSourceWithTier(engine, null, opts.cwd);
     // Only adopt the resolution when it improves on the seed_default
     // fallback — that preserves the v0.30.x "default-only when unset"
     // contract for the common case AND opens the sole_non_default
@@ -409,7 +411,7 @@ export async function runImport(
   // resolve against whatever CWD a later process happens to run from.
   let dir: string;
   try {
-    dir = resolveImportTargetDir(dirArg);
+    dir = resolveImportTargetDir(dirArg, opts.cwd);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`Import target is not readable: ${dirArg} (${msg})`);

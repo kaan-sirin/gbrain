@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { mcpProxySocketPath, probeCommandIpc } from '../../src/core/local-command-ipc.ts';
+import { commandSocketPath, mcpProxySocketPath, probeCommandIpc } from '../../src/core/local-command-ipc.ts';
 
 function testEnv(home: string): Record<string, string> {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key, value]) =>
@@ -57,6 +57,7 @@ describe('serve --local-daemon with DB-free stdio proxies', () => {
   let home: string;
   let env: Record<string, string>;
   let daemon: ChildProcess;
+  let commandSocket: string;
   const clients: Client[] = [];
   const transports: StdioClientTransport[] = [];
   const proxies: ChildProcess[] = [];
@@ -68,6 +69,7 @@ describe('serve --local-daemon with DB-free stdio proxies', () => {
       cwd: process.cwd(), env, stdio: 'ignore',
     });
     const config = JSON.parse(readFileSync(join(home, '.gbrain', 'config.json'), 'utf8')) as { database_path: string };
+    commandSocket = commandSocketPath(config.database_path);
     daemon = spawn('bun', ['run', 'src/cli.ts', 'serve', '--local-daemon'], {
       cwd: process.cwd(), env, stdio: ['ignore', 'ignore', 'pipe'],
     });
@@ -106,6 +108,28 @@ describe('serve --local-daemon with DB-free stdio proxies', () => {
     expect(toolsTwo.tools.some(tool => tool.name === 'get_brain_identity')).toBe(true);
     expect(identityOne.isError).not.toBe(true);
     expect(identityTwo.isError).not.toBe(true);
+  }, 60_000);
+
+  test('CLI import delegates to the daemon instead of colliding with its PGLite lock', () => {
+    const source = mkdtempSync(join(tmpdir(), 'gbrain-ipc-import-e2e-'));
+    try {
+      writeFileSync(join(source, 'delegated.md'), '---\ntitle: Delegated\n---\nImported while the daemon owns PGLite.\n');
+      const raw = execFileSync('bun', ['run', 'src/cli.ts', 'import', source, '--no-embed', '--json'], {
+        cwd: process.cwd(), env, encoding: 'utf8',
+      });
+      expect(JSON.parse(raw)).toMatchObject({ status: 'success', imported: 1, errors: 0 });
+    } finally {
+      rmSync(source, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('a rejected delegated import does not terminate the database-owning daemon', async () => {
+    const result = spawnSync('bun', ['run', 'src/cli.ts', 'import', join(home, 'missing'), '--no-embed'], {
+      cwd: process.cwd(), env, encoding: 'utf8',
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Error [import_failed]');
+    await expect(probeCommandIpc(commandSocket)).resolves.toBeUndefined();
   }, 60_000);
 
   test('MCP_STDIO proxy survives closed stdin until SIGTERM', async () => {
