@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withEnv } from './helpers/with-env.ts';
+import { VERSION } from '../src/version.ts';
 import {
   canSelfUpdate,
   clearSnooze,
@@ -217,6 +218,16 @@ describe('cache', () => {
       const entry = readUpdateCache()!;
       expect(isCacheFresh(entry, entry.mtimeMs + 59 * 60 * 1000)).toBe(true);
       expect(isCacheFresh(entry, entry.mtimeMs + 61 * 60 * 1000)).toBe(false);
+    });
+  });
+  test('obsolete upgrade marker is normalized after an external upgrade', async () => {
+    await withTmpHome(() => {
+      writeUpdateCache({
+        kind: 'upgrade_available',
+        current: '0.42.71.0',
+        latest: VERSION,
+      });
+      expect(readUpdateCache()?.marker).toEqual({ kind: 'up_to_date', current: VERSION });
     });
   });
   test('corrupt cache file → null (fail-open)', async () => {
