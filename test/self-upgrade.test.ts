@@ -203,9 +203,9 @@ describe('snooze', () => {
 describe('cache', () => {
   test('write → read round-trip, atomic, fresh check', async () => {
     await withTmpHome(() => {
-      writeUpdateCache({ kind: 'upgrade_available', current: '0.42.0', latest: '0.43.0' });
+      writeUpdateCache({ kind: 'upgrade_available', current: '0.42.0', latest: '9.99.0.0' });
       const entry = readUpdateCache();
-      expect(entry?.marker).toEqual({ kind: 'upgrade_available', current: '0.42.0', latest: '0.43.0' });
+      expect(entry?.marker).toEqual({ kind: 'upgrade_available', current: '0.42.0', latest: '9.99.0.0' });
       expect(isCacheFresh(entry!, entry!.mtimeMs + 1000)).toBe(true);
       expect(isCacheFresh(entry!, entry!.mtimeMs + 13 * 3600 * 1000)).toBe(false); // > 12h
       clearUpdateCache();

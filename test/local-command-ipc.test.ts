@@ -18,7 +18,13 @@ import {
 const dirs: string[] = [];
 const servers: net.Server[] = [];
 afterEach(async () => {
-  for (const server of servers.splice(0)) await new Promise<void>(resolve => server.close(() => resolve()));
+  await Promise.all(servers.splice(0).map(async (server) => {
+    try { server.closeAllConnections?.(); } catch { /* already closing */ }
+    await Promise.race([
+      new Promise<void>(resolve => server.close(() => resolve())),
+      new Promise<void>(resolve => setTimeout(resolve, 250)),
+    ]);
+  }));
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -44,23 +50,39 @@ function decodeFrame(frame: Buffer): unknown {
 function raw(path: string, pieces: Buffer[], gapMs = 0): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    let settled = false;
     const socket = net.createConnection({ path, allowHalfOpen: true });
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      for (const timer of timers) clearTimeout(timer);
+      try { socket.destroy(); } catch { /* already closed */ }
+      fn();
+    };
+    const writePiece = (buf: Buffer) => {
+      if (settled || socket.destroyed || !socket.writable) return;
+      socket.write(buf);
+    };
     socket.on('connect', () => {
       if (gapMs === 0) {
-        for (const piece of pieces) socket.write(piece);
+        for (const piece of pieces) writePiece(piece);
         return;
       }
       let index = 0;
       const writeNext = () => {
-        if (index === pieces.length) return;
-        socket.write(pieces[index++]!);
-        setTimeout(writeNext, gapMs);
+        if (settled || index >= pieces.length) return;
+        writePiece(pieces[index++]!);
+        if (index < pieces.length) timers.push(setTimeout(writeNext, gapMs));
       };
       writeNext();
     });
     socket.on('data', chunk => { chunks.push(Buffer.from(chunk)); });
-    socket.on('end', () => resolve(Buffer.concat(chunks)));
-    socket.on('error', reject);
+    socket.on('end', () => settle(() => resolve(Buffer.concat(chunks))));
+    socket.on('error', (error) => {
+      if (settled) return;
+      settle(() => reject(error));
+    });
   });
 }
 
@@ -179,7 +201,14 @@ describe('local command IPC', () => {
 
     const drip = join(base, 'drip.sock');
     const dripServer = net.createServer({ allowHalfOpen: true }, conn => {
-      const interval = setInterval(() => conn.write(Buffer.from([0])), 10);
+      const interval = setInterval(() => {
+        if (conn.destroyed || !conn.writable) {
+          clearInterval(interval);
+          return;
+        }
+        conn.write(Buffer.from([0]));
+      }, 10);
+      conn.on('error', () => clearInterval(interval));
       conn.once('close', () => clearInterval(interval));
     });
     await new Promise<void>(resolve => dripServer.listen(drip, resolve));
