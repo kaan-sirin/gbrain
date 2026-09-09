@@ -19,7 +19,8 @@ const dirs: string[] = [];
 const servers: net.Server[] = [];
 afterEach(async () => {
   await Promise.all(servers.splice(0).map(async (server) => {
-    try { server.closeAllConnections?.(); } catch { /* already closing */ }
+    const closeAll = (server as net.Server & { closeAllConnections?: () => void }).closeAllConnections;
+    try { closeAll?.call(server); } catch { /* already closing */ }
     await Promise.race([
       new Promise<void>(resolve => server.close(() => resolve())),
       new Promise<void>(resolve => setTimeout(resolve, 250)),
